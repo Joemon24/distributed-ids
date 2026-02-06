@@ -1,0 +1,25 @@
+# OS junk
+.DS_Store
+
+# Env files
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Go build artifacts
+*.exe
+*.out
+*.test
+/bin/
+
+# Agent runtime data
+agent/data/
+agent/logs/
+*.log
+*.hash
+
+# Test artifacts
+security_events.json
