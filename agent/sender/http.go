@@ -3,6 +3,7 @@ package sender
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 )
@@ -40,4 +41,12 @@ func (c *Client) SendBatch(events []EventEnvelope) error {
 	defer resp.Body.Close()
 
 	return nil
+}
+
+func (c *Client) Send(batch any) error {
+	events, ok := batch.([]EventEnvelope)
+	if !ok {
+		return fmt.Errorf("invalid batch type for HTTP sender")
+	}
+	return c.SendBatch(events)
 }

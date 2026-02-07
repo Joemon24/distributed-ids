@@ -5,13 +5,14 @@ import (
 	"time"
 
 	"agent/types"
+
 	"github.com/google/uuid"
 )
 
 func Parse(raw types.RawEvent, agent types.AgentInfo) types.NormalizedEvent {
 	event := types.NormalizedEvent{
 		EventID:         uuid.New().String(),
-		Timestamp:       raw.Timestamp,
+		Timestamp:       raw.Timestamp.UTC(),
 		IngestTimestamp: time.Now().UTC(),
 		Agent:           agent,
 		EventCategory:   raw.Category,
