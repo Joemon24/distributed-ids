@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta
-from collections import deque, defaultdict
+from collections import deque
 
 from kafka import KafkaConsumer
 from elasticsearch import Elasticsearch
@@ -28,13 +28,13 @@ es = Elasticsearch(
 
 try:
     info = es.info()
-    print("🟢 Connected to Elasticsearch")
+    print("Connected to Elasticsearch")
     print(f"   Cluster: {info['cluster_name']}")
 except Exception as e:
-    raise RuntimeError(f"❌ Elasticsearch not reachable: {e}")
+    raise RuntimeError(f"Elasticsearch not reachable: {e}")
 
 # =========================================================
-# FEATURE STATE (IN-MEMORY)
+# FEATURE + HASH STATE (IN-MEMORY)
 # =========================================================
 
 WINDOW_5M = timedelta(minutes=5)
@@ -42,6 +42,7 @@ WINDOW_1M = timedelta(minutes=1)
 
 event_history = deque()                 # (timestamp, event)
 last_heartbeat_time = {}                # agent_id -> datetime
+last_hash_per_agent = {}                # agent_id -> last hash
 
 # =========================================================
 # FEATURE COMPUTATION
@@ -97,10 +98,10 @@ consumer = KafkaConsumer(
     value_deserializer=lambda v: json.loads(v.decode("utf-8")),
 )
 
-print("🟢 Central Server Kafka Consumer started")
-print(f"🔗 Brokers: {KAFKA_BROKERS}")
-print(f"📥 Topic: {TOPIC}")
-print(f"📦 Index: {ES_INDEX}")
+print("Central Server Kafka Consumer started")
+print(f"Brokers: {KAFKA_BROKERS}")
+print(f"Topic: {TOPIC}")
+print(f"Index: {ES_INDEX}")
 
 # =========================================================
 # CONSUME LOOP
@@ -119,9 +120,35 @@ for msg in consumer:
         try:
             now = datetime.utcnow()
 
-            # ---------- FEATURE MATERIALIZATION ----------
+            # =================================================
+            # HASH CHAIN VERIFICATION
+            # =================================================
+
+            agent_id = event["agent"]["agent_id"]
+            current_hash = event.get("hash")
+            prev_hash = event.get("prev_hash")
+
+            stored_hash = last_hash_per_agent.get(agent_id)
+
+            if stored_hash and prev_hash != stored_hash:
+                event["chain_status"] = "broken"
+            else:
+                event["chain_status"] = "valid"
+
+            # Update last known hash
+            if current_hash:
+                last_hash_per_agent[agent_id] = current_hash
+
+            # =================================================
+            # FEATURE MATERIALIZATION
+            # =================================================
+
             features = compute_features(event, now)
             event["features"] = features
+
+            # =================================================
+            # STORE IN ELASTICSEARCH
+            # =================================================
 
             es.index(
                 index=ES_INDEX,
@@ -131,9 +158,9 @@ for msg in consumer:
             indexed += 1
 
         except Exception as e:
-            print("❌ Elasticsearch index failed:", e)
+            print(" Elasticsearch index failed:", e)
 
     print(
-        f"✅ Indexed {indexed} events | "
+        f" Indexed {indexed} events | "
         f"partition={msg.partition} offset={msg.offset}"
     )

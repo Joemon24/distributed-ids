@@ -55,10 +55,10 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 	/* ---------- METRICS ---------- */
 
 	var (
-		totalHeartbeats uint64
+		totalHeartbeats   uint64
 		totalEventBatches uint64
-		totalEvents uint64
-		kafkaHealthy atomic.Bool
+		totalEvents       uint64
+		kafkaHealthy      atomic.Bool
 	)
 
 	kafkaHealthy.Store(true)

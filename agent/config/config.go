@@ -3,6 +3,8 @@ package config
 import (
 	"errors"
 	"os"
+
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -12,6 +14,7 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
+	_ = godotenv.Load()
 	cfg := &Config{
 		AgentID:      os.Getenv("AGENT_ID"),
 		AgentType:    os.Getenv("AGENT_TYPE"),
