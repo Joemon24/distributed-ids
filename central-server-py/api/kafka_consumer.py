@@ -1,89 +1,437 @@
+# =========================================================
+# IMPORTS
+# =========================================================
+
 import json
-from datetime import datetime, timedelta
-from collections import deque
+import random
+import re
+import os
+import joblib
+
+from datetime import datetime, timedelta, timezone
+from collections import deque, defaultdict, Counter
 
 from kafka import KafkaConsumer
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, helpers
+
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+import numpy as np
 
 # =========================================================
 # CONFIG
 # =========================================================
 
 KAFKA_BROKERS = ["localhost:19092"]
+
 TOPIC = "ids.events.v1"
-GROUP_ID = "central-server"
+
+GROUP_ID = "central-server-final-v31"
 
 ES_HOST = "http://localhost:9200"
+
 ES_INDEX = "ids-events"
 
+MODEL_PATH = "models/isolation_forest.pkl"
+
+SCALER_PATH = "models/scaler.pkl"
+
+TRAINING_DATA_PATH = "models/training_data.pkl"
+
 # =========================================================
-# ELASTICSEARCH CLIENT (ES 8.x SAFE)
+# ELASTICSEARCH
 # =========================================================
 
 es = Elasticsearch(
     ES_HOST,
-    verify_certs=False,        # dev only
-    request_timeout=10,
+    verify_certs=False,
+    request_timeout=30
 )
 
-try:
-    info = es.info()
-    print("Connected to Elasticsearch")
-    print(f"   Cluster: {info['cluster_name']}")
-except Exception as e:
-    raise RuntimeError(f"Elasticsearch not reachable: {e}")
+bulk_buffer = []
+
+BULK_SIZE = 100
 
 # =========================================================
-# FEATURE + HASH STATE (IN-MEMORY)
+# MODEL
+# =========================================================
+
+scaler = StandardScaler()
+
+model = IsolationForest(
+    n_estimators=300,
+    contamination=0.02,
+    random_state=42
+)
+
+training_data = []
+
+model_trained = False
+
+TRAINING_LIMIT = 500
+
+# =========================================================
+# WINDOWS
 # =========================================================
 
 WINDOW_5M = timedelta(minutes=5)
+
 WINDOW_1M = timedelta(minutes=1)
 
-event_history = deque()                 # (timestamp, event)
-last_heartbeat_time = {}                # agent_id -> datetime
-last_hash_per_agent = {}                # agent_id -> last hash
-
 # =========================================================
-# FEATURE COMPUTATION
+# STATE
 # =========================================================
 
-def compute_features(event: dict, now: datetime) -> dict:
+user_history = {}
+
+ip_history = {}
+
+fail_streak = defaultdict(int)
+
+trust_scores = defaultdict(lambda: 1.0)
+
+MAX_HISTORY_KEYS = 10000
+
+# =========================================================
+# MODEL DIRECTORY
+# =========================================================
+
+os.makedirs("models", exist_ok=True)
+
+# =========================================================
+# LOAD TRAINING DATA
+# =========================================================
+
+if os.path.exists(TRAINING_DATA_PATH):
+
+    try:
+
+        training_data = joblib.load(
+            TRAINING_DATA_PATH
+        )
+
+        print(
+            f"✅ Loaded training data: "
+            f"{len(training_data)} samples"
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ Failed loading training data: {e}"
+        )
+
+# =========================================================
+# LOAD MODEL
+# =========================================================
+
+if (
+    os.path.exists(MODEL_PATH)
+    and os.path.exists(SCALER_PATH)
+):
+
+    try:
+
+        model = joblib.load(MODEL_PATH)
+
+        scaler = joblib.load(SCALER_PATH)
+
+        model_trained = True
+
+        print("✅ Loaded trained model")
+
+    except Exception as e:
+
+        print(
+            f"❌ Failed loading model: {e}"
+        )
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def safe_div(a, b):
+
+    return round(a / max(b, 1), 2)
+
+# =========================================================
+# PARSERS
+# =========================================================
+
+def extract_ip(event):
+
+    raw = event.get("raw", "")
+
+    match = re.search(r'ip=([\d\.]+)', raw)
+
+    if match:
+        return match.group(1)
+
+    return f"10.0.0.{random.randint(10,20)}"
+
+
+def extract_user(event):
+
+    raw = event.get("raw", "")
+
+    match = re.search(r'user=([\w\-]+)', raw)
+
+    if match:
+        return match.group(1)
+
+    return f"user{random.randint(1,10)}"
+
+
+def extract_outcome(event):
+
+    raw = event.get("raw", "").lower()
+
+    if "failed" in raw or "failure" in raw:
+        return "failure"
+
+    if "success" in raw or "accepted" in raw:
+        return "success"
+
+    return "success"
+
+# =========================================================
+# FEATURE ENGINE
+# =========================================================
+
+def compute_features(event, now):
+
     agent_id = event["agent"]["agent_id"]
 
-    # ---- Maintain sliding window ----
-    event_history.append((now, event))
+    ip = extract_ip(event)
 
-    while event_history and event_history[0][0] < now - WINDOW_5M:
-        event_history.popleft()
+    user = extract_user(event)
 
-    # ---- Feature 1: failed auth count (5 min) ----
+    outcome = extract_outcome(event)
+
+    # =====================================================
+    # USER HISTORY
+    # =====================================================
+
+    user_key = f"{agent_id}:{user}"
+
+    if user_key not in user_history:
+        user_history[user_key] = deque()
+
+    u_history = user_history[user_key]
+
+    u_history.append((now, ip, outcome))
+
+    while (
+        u_history
+        and u_history[0][0] < now - WINDOW_5M
+    ):
+        u_history.popleft()
+
+    # =====================================================
+    # IP HISTORY
+    # =====================================================
+
+    ip_key = f"{agent_id}:{ip}"
+
+    if ip_key not in ip_history:
+        ip_history[ip_key] = deque()
+
+    i_history = ip_history[ip_key]
+
+    i_history.append((now, user, outcome))
+
+    while (
+        i_history
+        and i_history[0][0] < now - WINDOW_5M
+    ):
+        i_history.popleft()
+
+    # =====================================================
+    # FAIL STREAK
+    # =====================================================
+
+    if outcome == "failure":
+        fail_streak[user_key] += 1
+    else:
+        fail_streak[user_key] = 0
+
+    # =====================================================
+    # USER FEATURES
+    # =====================================================
+
     failed_auth_count_5m = sum(
-        1 for ts, e in event_history
-        if e["event"]["category"] == "auth"
-        and e["event"]["outcome"] == "failure"
-        and ts >= now - WINDOW_5M
+        1 for _, _, o in u_history
+        if o == "failure"
     )
 
-    # ---- Feature 2: event rate (1 min) ----
     event_rate_1m = sum(
-        1 for ts, _ in event_history
+        1 for ts, _, _ in u_history
         if ts >= now - WINDOW_1M
     )
 
-    # ---- Feature 3: heartbeat gap ----
-    heartbeat_gap_seconds = None
-    if event["event"]["type"] == "heartbeat":
-        prev = last_heartbeat_time.get(agent_id)
-        if prev:
-            heartbeat_gap_seconds = (now - prev).total_seconds()
-        last_heartbeat_time[agent_id] = now
+    failed_ratio = safe_div(
+        failed_auth_count_5m,
+        len(u_history)
+    )
+
+    ips = [ip for _, ip, _ in u_history]
+
+    ip_counts = Counter(ips)
+
+    top_ip_count = (
+        ip_counts.most_common(1)[0][1]
+        if ip_counts else 0
+    )
+
+    dominance_ratio = safe_div(
+        top_ip_count,
+        len(u_history)
+    )
+
+    unique_ips = len(set(ips))
+
+    # =====================================================
+    # IP FEATURES
+    # =====================================================
+
+    unique_users = len(set(
+        user for _, user, _ in i_history
+    ))
+
+    ip_failures = sum(
+        1 for _, _, o in i_history
+        if o == "failure"
+    )
+
+    ip_failed_ratio = safe_div(
+        ip_failures,
+        len(i_history)
+    )
+
+    ip_rate_1m = sum(
+        1 for ts, _, _ in i_history
+        if ts >= now - WINDOW_1M
+    )
+
+    # =====================================================
+    # TEMPORAL FEATURES
+    # =====================================================
+
+    hour_of_day = now.hour
 
     return {
-        "failed_auth_count_5m": failed_auth_count_5m,
-        "event_rate_1m": event_rate_1m,
-        "heartbeat_gap_seconds": heartbeat_gap_seconds,
+
+        "failed_auth_count_5m":
+            failed_auth_count_5m,
+
+        "event_rate_1m":
+            event_rate_1m,
+
+        "failed_ratio":
+            failed_ratio,
+
+        "fail_streak":
+            fail_streak[user_key],
+
+        "dominance_ratio":
+            dominance_ratio,
+
+        "unique_ips":
+            unique_ips,
+
+        "unique_users":
+            unique_users,
+
+        "ip_failed_ratio":
+            ip_failed_ratio,
+
+        "ip_rate_1m":
+            ip_rate_1m,
+
+        "hour_of_day":
+            hour_of_day,
     }
+
+# =========================================================
+# VECTOR
+# =========================================================
+
+def extract_vector(f):
+
+    return [
+
+        f["failed_ratio"],
+
+        min(f["fail_streak"] / 20, 1),
+
+        min(f["event_rate_1m"] / 200, 1),
+
+        f["dominance_ratio"],
+
+        min(f["unique_ips"] / 20, 1),
+
+        min(f["unique_users"] / 20, 1),
+
+        f["ip_failed_ratio"],
+
+        min(f["ip_rate_1m"] / 200, 1),
+
+        min(f["hour_of_day"] / 24, 1),
+    ]
+
+# =========================================================
+# TRUST ENGINE
+# =========================================================
+
+def update_trust_score(
+    current_trust,
+    features,
+    anomaly_score,
+    outcome,
+    alert_type
+):
+
+    trust = current_trust
+
+    if (
+        outcome == "success"
+        and anomaly_score < 0.20
+        and features["failed_ratio"] < 0.10
+    ):
+        trust += 0.03
+
+    if outcome == "failure":
+
+        if features["failed_auth_count_5m"] <= 2:
+            trust -= 0.01
+        else:
+            trust -= 0.05
+
+    if features["fail_streak"] >= 5:
+        trust -= 0.08
+
+    if features["fail_streak"] >= 10:
+        trust -= 0.15
+
+    if anomaly_score > 0.50:
+        trust -= 0.10
+
+    if anomaly_score > 0.75:
+        trust -= 0.15
+
+    if alert_type == "password_spraying":
+        trust -= 0.20
+
+    elif alert_type == "brute_force":
+        trust -= 0.30
+
+    elif alert_type == "lateral_movement":
+        trust -= 0.20
+
+    trust = np.clip(trust, 0.0, 1.0)
+
+    return round(float(trust), 2)
 
 # =========================================================
 # KAFKA CONSUMER
@@ -93,74 +441,449 @@ consumer = KafkaConsumer(
     TOPIC,
     bootstrap_servers=KAFKA_BROKERS,
     group_id=GROUP_ID,
-    auto_offset_reset="earliest",
+    auto_offset_reset="latest",
     enable_auto_commit=True,
-    value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+    value_deserializer=lambda v: json.loads(
+        v.decode("utf-8")
+    ),
 )
 
-print("Central Server Kafka Consumer started")
-print(f"Brokers: {KAFKA_BROKERS}")
-print(f"Topic: {TOPIC}")
-print(f"Index: {ES_INDEX}")
+print("🚀 Consumer started...")
 
 # =========================================================
-# CONSUME LOOP
+# MAIN LOOP
 # =========================================================
 
-for msg in consumer:
-    payload = msg.value
+try:
 
-    # Agent sends batches
-    if not isinstance(payload, list):
-        payload = [payload]
+    for msg in consumer:
 
-    indexed = 0
+        payload = msg.value
 
-    for event in payload:
-        try:
-            now = datetime.utcnow()
+        if not isinstance(payload, list):
+            payload = [payload]
 
-            # =================================================
-            # HASH CHAIN VERIFICATION
-            # =================================================
+        for event in payload:
 
-            agent_id = event["agent"]["agent_id"]
-            current_hash = event.get("hash")
-            prev_hash = event.get("prev_hash")
+            try:
 
-            stored_hash = last_hash_per_agent.get(agent_id)
+                now = datetime.now(timezone.utc)
 
-            if stored_hash and prev_hash != stored_hash:
-                event["chain_status"] = "broken"
-            else:
-                event["chain_status"] = "valid"
+                if "agent" not in event:
 
-            # Update last known hash
-            if current_hash:
-                last_hash_per_agent[agent_id] = current_hash
+                    event["agent"] = {
+                        "agent_id": "default"
+                    }
 
-            # =================================================
-            # FEATURE MATERIALIZATION
-            # =================================================
+                # =================================================
+                # CLEANUP
+                # =================================================
 
-            features = compute_features(event, now)
-            event["features"] = features
+                if len(user_history) > MAX_HISTORY_KEYS:
 
-            # =================================================
-            # STORE IN ELASTICSEARCH
-            # =================================================
+                    oldest_keys = list(
+                        user_history.keys()
+                    )[:1000]
 
-            es.index(
-                index=ES_INDEX,
-                document=event,
-            )
+                    for key in oldest_keys:
+                        user_history.pop(key, None)
 
-            indexed += 1
+                if len(ip_history) > MAX_HISTORY_KEYS:
 
-        except Exception as e:
-            print(" Elasticsearch index failed:", e)
+                    oldest_keys = list(
+                        ip_history.keys()
+                    )[:1000]
 
-    print(
-        f" Indexed {indexed} events | "
-        f"partition={msg.partition} offset={msg.offset}"
-    )
+                    for key in oldest_keys:
+                        ip_history.pop(key, None)
+
+                # =================================================
+                # FEATURES
+                # =================================================
+
+                features = compute_features(
+                    event,
+                    now
+                )
+
+                event["src_ip"] = extract_ip(event)
+
+                event["username"] = extract_user(event)
+
+                event["outcome"] = extract_outcome(event)
+
+                event["features"] = features
+
+                vector = extract_vector(features)
+
+                # =================================================
+                # MODEL
+                # =================================================
+
+                if not model_trained:
+
+                    if (
+                        features["failed_ratio"] < 0.20
+                        and features["event_rate_1m"] < 40
+                        and features["ip_failed_ratio"] < 0.40
+                    ):
+
+                        training_data.append(vector)
+
+                        joblib.dump(
+                            training_data,
+                            TRAINING_DATA_PATH
+                        )
+
+                    print(
+                        f"📊 Training size: "
+                        f"{len(training_data)}"
+                    )
+
+                    if len(training_data) >= TRAINING_LIMIT:
+
+                        print(
+                            "🔥 TRAINING MODEL..."
+                        )
+
+                        X = scaler.fit_transform(
+                            training_data
+                        )
+
+                        model.fit(X)
+
+                        joblib.dump(
+                            model,
+                            MODEL_PATH
+                        )
+
+                        joblib.dump(
+                            scaler,
+                            SCALER_PATH
+                        )
+
+                        model_trained = True
+
+                        print(
+                            "✅ MODEL TRAINED & SAVED"
+                        )
+
+                    anomaly_score = 0.0
+
+                else:
+
+                    X = scaler.transform([vector])
+
+                    score = model.decision_function(
+                        X
+                    )[0]
+
+                    base_score = float(
+                        np.clip(
+                            -score * 1.8,
+                            0,
+                            1
+                        )
+                    )
+
+                    if (
+                        features["fail_streak"] <= 2
+                        and features["failed_ratio"] < 0.60
+                    ):
+                        base_score *= 0.30
+
+                    if (
+                        features["event_rate_1m"] <= 3
+                        and features["ip_rate_1m"] <= 3
+                    ):
+                        base_score *= 0.50
+
+                    anomaly_score = round(
+                        min(base_score, 1.0),
+                        2
+                    )
+
+                # =================================================
+                # BOOSTS
+                # =================================================
+
+                boost = 0
+
+                if features["fail_streak"] >= 5:
+                    boost += 0.10
+
+                if features["fail_streak"] >= 10:
+                    boost += 0.20
+
+                if (
+                    features["failed_ratio"] > 0.30
+                    and features["failed_auth_count_5m"] >= 3
+                ):
+                    boost += 0.10
+
+                if (
+                    features["failed_ratio"] > 0.60
+                    and features["failed_auth_count_5m"] >= 5
+                ):
+                    boost += 0.20
+
+                # PASSWORD SPRAYING
+
+                if (
+                    features["unique_users"] >= 6
+                    and features["ip_failed_ratio"] > 0.50
+                    and features["ip_rate_1m"] >= 6
+                ):
+                    boost += 0.40
+
+                # LATERAL MOVEMENT
+
+                if (
+                    features["unique_ips"] >= 6
+                    and features["event_rate_1m"] > 12
+                ):
+                    boost += 0.30
+
+                anomaly_score = round(
+                    min(anomaly_score + boost, 1.0),
+                    2
+                )
+
+                # =================================================
+                # ALERT TYPES
+                # =================================================
+
+                alert_type = "normal"
+
+                # BRUTE FORCE
+
+                if (
+                    features["fail_streak"] >= 8
+                    and features["failed_auth_count_5m"] >= 8
+                    and features["failed_ratio"] > 0.65
+                ):
+                    alert_type = "brute_force"
+
+                # PASSWORD SPRAYING
+
+                elif (
+                    features["unique_users"] >= 6
+                    and features["ip_failed_ratio"] > 0.50
+                    and features["ip_rate_1m"] >= 6
+                ):
+                    alert_type = "password_spraying"
+
+                # LATERAL MOVEMENT
+
+                elif (
+                    features["unique_ips"] >= 6
+                    and features["event_rate_1m"] > 12
+                    and anomaly_score > 0.45
+                ):
+                    alert_type = "lateral_movement"
+
+                # GENERIC ANOMALY
+
+                elif (
+                    anomaly_score > 0.70
+                    and (
+                        features["failed_ratio"] > 0.20
+                        or features["event_rate_1m"] > 80
+                        or features["ip_failed_ratio"] > 0.30
+                    )
+                ):
+                    alert_type = "anomaly"
+
+                # =================================================
+                # SEVERITY
+                # =================================================
+
+                if anomaly_score >= 0.85:
+                    severity = "critical"
+
+                elif anomaly_score >= 0.60:
+                    severity = "high"
+
+                elif anomaly_score >= 0.35:
+                    severity = "medium"
+
+                else:
+                    severity = "low"
+
+                # =================================================
+                # MITRE
+                # =================================================
+
+                mitre_mapping = {
+
+                    "brute_force":
+                        "T1110",
+
+                    "password_spraying":
+                        "T1110.003",
+
+                    "lateral_movement":
+                        "TA0008",
+
+                    "credential_stuffing":
+                        "T1110.004",
+
+                    "anomaly":
+                        "T1078"
+                }
+
+                mitre_technique = mitre_mapping.get(
+                    alert_type,
+                    "none"
+                )
+
+                # =================================================
+                # TRUST
+                # =================================================
+
+                user = extract_user(event)
+
+                outcome = extract_outcome(event)
+
+                trust_key = (
+                    f"{event['agent']['agent_id']}:{user}"
+                )
+
+                current_trust = trust_scores[
+                    trust_key
+                ]
+
+                updated_trust = update_trust_score(
+                    current_trust,
+                    features,
+                    anomaly_score,
+                    outcome,
+                    alert_type
+                )
+
+                trust_scores[
+                    trust_key
+                ] = updated_trust
+
+                # =================================================
+                # RISK
+                # =================================================
+
+                event["risk"] = {
+
+                    "anomaly_score":
+                        anomaly_score,
+
+                    "trust_score":
+                        updated_trust,
+
+                    "alert_type":
+                        alert_type,
+
+                    "severity":
+                        severity,
+
+                    "mitre_technique":
+                        mitre_technique,
+
+                    "confidence":
+                        round(
+                            min(
+                                1.0,
+                                (
+                                    anomaly_score
+                                    + (
+                                        features[
+                                            "failed_ratio"
+                                        ] * 0.7
+                                    )
+                                    + (
+                                        features[
+                                            "fail_streak"
+                                        ] * 0.02
+                                    )
+                                )
+                            ),
+                            2
+                        ),
+                }
+
+                # =================================================
+                # TIMESTAMP
+                # =================================================
+
+                event["@timestamp"] = (
+                    now.isoformat()
+                )
+
+                # =================================================
+                # OUTPUT
+                # =================================================
+
+                print(
+                    f"🚨 "
+                    f"A={anomaly_score:.2f} | "
+                    f"T={updated_trust:.2f} | "
+                    f"S={severity} | "
+                    f"Type={alert_type} | "
+                    f"MITRE={mitre_technique} | "
+                    f"Fail={features['failed_auth_count_5m']} | "
+                    f"Streak={features['fail_streak']} | "
+                    f"Users={features['unique_users']} | "
+                    f"IPs={features['unique_ips']} | "
+                    f"Rate={features['event_rate_1m']} | "
+                    f"IPRate={features['ip_rate_1m']} | "
+                    f"Ratio={features['failed_ratio']:.2f} | "
+                    f"IPRatio={features['ip_failed_ratio']:.2f}"
+                )
+
+                # =================================================
+                # BULK INSERT
+                # =================================================
+
+                bulk_buffer.append({
+
+                    "_index": ES_INDEX,
+
+                    "_source": event
+                })
+
+                if len(bulk_buffer) >= BULK_SIZE:
+
+                    helpers.bulk(
+                        es,
+                        bulk_buffer
+                    )
+
+                    print(
+                        f"📦 Bulk inserted "
+                        f"{len(bulk_buffer)}"
+                    )
+
+                    bulk_buffer.clear()
+
+            except Exception as e:
+
+                print("❌ Error:", e)
+
+except KeyboardInterrupt:
+
+    print("\n🛑 Stopping consumer...")
+
+finally:
+
+    if bulk_buffer:
+
+        helpers.bulk(
+            es,
+            bulk_buffer
+        )
+
+        print(
+            f"📦 Final flush: "
+            f"{len(bulk_buffer)} events"
+        )
+
+    consumer.close()
+
+    print("✅ Consumer closed")

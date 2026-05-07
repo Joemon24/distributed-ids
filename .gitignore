@@ -23,3 +23,6 @@ agent/logs/
 
 # Test artifacts
 security_events.json
+
+
+central-server-py/models/*.pkl

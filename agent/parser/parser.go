@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
@@ -8,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 )
+
+var ipRegex = regexp.MustCompile(`\b\d{1,3}(\.\d{1,3}){3}\b`)
 
 func Parse(raw types.RawEvent, agent types.AgentInfo) types.NormalizedEvent {
 	event := types.NormalizedEvent{
@@ -28,19 +31,28 @@ func Parse(raw types.RawEvent, agent types.AgentInfo) types.NormalizedEvent {
 
 	line := strings.ToLower(raw.Line)
 
-	// VERY BASIC auth logic (placeholder)
+	/* ---------- AUTH LOGIC ---------- */
+
 	if raw.Category == "auth" {
-		if strings.Contains(line, "failed") {
-			event.EventType = "authentication"
-			event.Action = "failed"
+
+		event.EventType = "authentication"
+
+		if strings.Contains(line, "failure") || strings.Contains(line, "failed") {
+			event.Action = "login_failed"
 			event.Outcome = "failure"
 			event.Severity = "medium"
 		}
+
 		if strings.Contains(line, "success") {
-			event.EventType = "authentication"
-			event.Action = "allowed"
+			event.Action = "login_success"
 			event.Outcome = "success"
 			event.Severity = "info"
+		}
+
+		// Extract IP (if exists)
+		ip := ipRegex.FindString(line)
+		if ip != "" {
+			event.SourceEntity["ip"] = ip
 		}
 	}
 

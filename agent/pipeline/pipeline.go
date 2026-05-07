@@ -2,14 +2,12 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"os"
 	"sync/atomic"
 	"time"
 
 	"agent/batcher"
-	"agent/buffer"
 	"agent/features"
 	"agent/hasher"
 	"agent/monitor"
@@ -27,7 +25,7 @@ type Pipeline struct {
 /* ================= SEND QUEUE ITEM ================= */
 
 type SendItem struct {
-	Kind string // "events" | "heartbeat" | "replay"
+	Kind string
 	Data []sender.EventEnvelope
 }
 
@@ -52,8 +50,6 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 	startTime := time.Now()
 	heartbeatInterval := 10 * time.Second
 
-	/* ---------- METRICS ---------- */
-
 	var (
 		totalHeartbeats   uint64
 		totalEventBatches uint64
@@ -63,18 +59,12 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 
 	kafkaHealthy.Store(true)
 
-	/* ---------- CHANNELS ---------- */
-
 	rawEvents := make(chan types.RawEvent, 200)
 	enriched := make(chan any, 200)
 	batches := make(chan batcher.Batch, 10)
 	sendQueue := make(chan SendItem, 20)
 
-	/* ---------- FEATURE EXTRACTOR ---------- */
-
 	extractor := features.New()
-
-	/* ---------- BATCHER ---------- */
 
 	b := batcher.New(batcher.Config{
 		MaxEvents:   5,
@@ -82,7 +72,7 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 	})
 	b.Run(ctx, enriched, batches)
 
-	/* ---------- HASH CHAIN ---------- */
+	/* ---------- HASH ---------- */
 
 	hashPath := os.Getenv("HASH_STATE_PATH")
 	if hashPath == "" {
@@ -100,45 +90,17 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 		trustOK = false
 	}
 
-	/* ---------- TRANSPORT ---------- */
+	/* ---------- SENDER ---------- */
 
 	var outSender sender.Sender
 
-	switch os.Getenv("TRANSPORT") {
-	case "kafka":
+	if os.Getenv("TRANSPORT") == "kafka" {
 		outSender = sender.NewKafkaSender()
 		log.Println("transport=kafka")
-	default:
-		endpoint := os.Getenv("CS_ENDPOINT")
-		if endpoint == "" {
-			endpoint = "http://localhost:8000/ingest"
-		}
-		outSender = sender.New(endpoint)
+	} else {
+		outSender = sender.New("http://localhost:8000/ingest")
 		log.Println("transport=http")
 	}
-
-	/* ---------- DISK BUFFER ---------- */
-
-	disk := buffer.New("./data/send-buffer.jsonl")
-
-	// Replay buffered batches on startup
-	go func() {
-		recs, err := disk.ReadAll()
-		if err != nil || len(recs) == 0 {
-			return
-		}
-
-		log.Printf("replaying %d buffered batches", len(recs))
-
-		for _, raw := range recs {
-			var batch []sender.EventEnvelope
-			if err := json.Unmarshal(raw, &batch); err == nil {
-				sendQueue <- SendItem{Kind: "replay", Data: batch}
-			}
-		}
-
-		_ = disk.Clear()
-	}()
 
 	/* ---------- RETRY WORKER ---------- */
 
@@ -150,58 +112,32 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 
 			case item := <-sendQueue:
 				backoff := 500 * time.Millisecond
-				delivered := false
 
 				for attempt := 1; attempt <= 5; attempt++ {
 					err := outSender.Send(item.Data)
+
 					if err == nil {
 						kafkaHealthy.Store(true)
 
 						switch item.Kind {
 						case "heartbeat":
 							h := atomic.AddUint64(&totalHeartbeats, 1)
-							log.Printf(
-								"heartbeat delivered (total=%d kafka_healthy=%v)",
-								h,
-								kafkaHealthy.Load(),
-							)
+							log.Printf("heartbeat delivered (total=%d)", h)
 
 						case "events":
 							b := atomic.AddUint64(&totalEventBatches, 1)
 							e := atomic.AddUint64(&totalEvents, uint64(len(item.Data)))
-							log.Printf(
-								"events delivered (batches=%d events=%d)",
-								b,
-								e,
-							)
-
-						case "replay":
-							log.Printf(
-								"replayed batch delivered (events=%d)",
-								len(item.Data),
-							)
+							log.Printf("events delivered (batches=%d events=%d)", b, e)
 						}
 
-						delivered = true
 						break
 					}
 
 					kafkaHealthy.Store(false)
-					log.Printf(
-						"%s send failed (attempt %d): %v",
-						item.Kind,
-						attempt,
-						err,
-					)
+					log.Printf("send failed (attempt %d): %v", attempt, err)
 
 					time.Sleep(backoff)
 					backoff *= 2
-				}
-
-				if !delivered {
-					trustOK = false
-					log.Printf("%s persisted to disk", item.Kind)
-					_ = disk.Append(item.Data)
 				}
 			}
 		}
@@ -240,15 +176,15 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 							Severity: "info",
 						},
 
+						RawEvent: sender.RawBlock{
+							Format: "meta",
+							Data:   "uptime=" + time.Since(startTime).String(),
+						},
+
 						Integrity: sender.IntegrityBlock{
 							Hash:     prevHash,
 							PrevHash: prevHash,
 							ChainID:  agentInfo.AgentID,
-						},
-
-						RawEvent: sender.RawBlock{
-							Format: "meta",
-							Data:   "uptime=" + time.Since(startTime).String(),
 						},
 					},
 				}
@@ -263,13 +199,13 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 		}
 	}()
 
-	/* ---------- START MONITORS ---------- */
+	/* ---------- MONITORS ---------- */
 
 	for _, m := range p.monitors {
 		m.Start(ctx, rawEvents)
 	}
 
-	/* ---------- PARSE LOOP ---------- */
+	/* ---------- PARSE ---------- */
 
 	go func() {
 		for {
@@ -285,7 +221,7 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 		}
 	}()
 
-	/* ---------- BATCH → HASH → QUEUE ---------- */
+	/* ---------- MAIN LOOP ---------- */
 
 	for {
 		select {
@@ -297,13 +233,14 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 			newHash, err := hasher.ComputeHash(prevHash, batch.Events)
 			if err != nil {
 				trustOK = false
-				log.Printf("hash computation failed: %v", err)
+				log.Printf("hash error: %v", err)
 				continue
 			}
 
 			_ = hashState.SaveLastHash(newHash)
 
 			var out []sender.EventEnvelope
+
 			for _, item := range batch.Events {
 				n := item.(map[string]any)["normalized"].(types.NormalizedEvent)
 
@@ -311,12 +248,14 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 					EventID:         n.EventID,
 					Timestamp:       n.Timestamp.UTC().Format(time.RFC3339),
 					IngestTimestamp: n.IngestTimestamp.UTC().Format(time.RFC3339),
+
 					Agent: sender.AgentBlock{
 						AgentID:      agentInfo.AgentID,
 						AgentType:    agentInfo.AgentType,
 						AgentVersion: agentInfo.AgentVersion,
 						TrustScore:   map[bool]float64{true: 1, false: 0}[trustOK],
 					},
+
 					Event: sender.EventBlock{
 						Category: n.EventCategory,
 						Type:     n.EventType,
@@ -324,11 +263,13 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 						Outcome:  n.Outcome,
 						Severity: n.Severity,
 					},
+
 					Integrity: sender.IntegrityBlock{
 						Hash:     newHash,
 						PrevHash: prevHash,
 						ChainID:  agentInfo.AgentID,
 					},
+
 					RawEvent: sender.RawBlock{
 						Format: "text",
 						Data:   n.Raw.Line,
@@ -336,14 +277,8 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 				})
 			}
 
-			select {
-			case sendQueue <- SendItem{Kind: "events", Data: out}:
-				log.Printf("events enqueued: id=%s count=%d", batch.ID, batch.Count)
-			default:
-				trustOK = false
-				log.Printf("event batch persisted: id=%s", batch.ID)
-				_ = disk.Append(out)
-			}
+			sendQueue <- SendItem{Kind: "events", Data: out}
+			log.Printf("events enqueued: id=%s count=%d", batch.ID, batch.Count)
 
 			prevHash = newHash
 		}
