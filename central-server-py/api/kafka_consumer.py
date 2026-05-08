@@ -7,6 +7,7 @@ import random
 import re
 import os
 import joblib
+import numpy as np
 
 from datetime import datetime, timedelta, timezone
 from collections import deque, defaultdict, Counter
@@ -17,7 +18,47 @@ from elasticsearch import Elasticsearch, helpers
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
-import numpy as np
+# =========================================================
+# SOAR IMPORTS
+# =========================================================
+
+from api.soar.alert_manager import create_alert
+
+from api.soar.incident_manager import (
+    create_incident
+)
+
+from api.soar.response_engine import (
+    block_ip,
+    is_blocked
+)
+
+from api.soar.notifier import (
+    send_notification
+)
+# =========================================================
+# SOAR
+# =========================================================
+
+def trigger_soar(event):
+
+    try:
+
+        create_alert(event)
+
+        create_incident(event)
+
+        block_ip(
+            event.get("src_ip")
+        )
+
+        send_notification(event)
+
+    except Exception as e:
+
+        print(
+            f"[SOAR ERROR] {e}"
+        )
 
 # =========================================================
 # CONFIG
@@ -314,10 +355,6 @@ def compute_features(event, now):
         if ts >= now - WINDOW_1M
     )
 
-    # =====================================================
-    # TEMPORAL FEATURES
-    # =====================================================
-
     hour_of_day = now.hour
 
     return {
@@ -400,6 +437,17 @@ def update_trust_score(
         and features["failed_ratio"] < 0.10
     ):
         trust += 0.03
+    if (
+
+    outcome == "success"
+
+    and anomaly_score < 0.10
+
+    and features["fail_streak"] == 0
+
+):
+
+        trust += 0.05
 
     if outcome == "failure":
 
@@ -508,6 +556,19 @@ try:
 
                 event["src_ip"] = extract_ip(event)
 
+                # =================================================
+                # BLOCKED IP CHECK
+                # =================================================
+
+                if is_blocked(event["src_ip"]):
+
+                    print(
+                        f"[SOAR] Ignoring blocked IP "
+                        f"{event['src_ip']}"
+                    )
+
+                    continue
+
                 event["username"] = extract_user(event)
 
                 event["outcome"] = extract_outcome(event)
@@ -521,52 +582,6 @@ try:
                 # =================================================
 
                 if not model_trained:
-
-                    if (
-                        features["failed_ratio"] < 0.20
-                        and features["event_rate_1m"] < 40
-                        and features["ip_failed_ratio"] < 0.40
-                    ):
-
-                        training_data.append(vector)
-
-                        joblib.dump(
-                            training_data,
-                            TRAINING_DATA_PATH
-                        )
-
-                    print(
-                        f"📊 Training size: "
-                        f"{len(training_data)}"
-                    )
-
-                    if len(training_data) >= TRAINING_LIMIT:
-
-                        print(
-                            "🔥 TRAINING MODEL..."
-                        )
-
-                        X = scaler.fit_transform(
-                            training_data
-                        )
-
-                        model.fit(X)
-
-                        joblib.dump(
-                            model,
-                            MODEL_PATH
-                        )
-
-                        joblib.dump(
-                            scaler,
-                            SCALER_PATH
-                        )
-
-                        model_trained = True
-
-                        print(
-                            "✅ MODEL TRAINED & SAVED"
-                        )
 
                     anomaly_score = 0.0
 
@@ -627,16 +642,12 @@ try:
                 ):
                     boost += 0.20
 
-                # PASSWORD SPRAYING
-
                 if (
                     features["unique_users"] >= 6
                     and features["ip_failed_ratio"] > 0.50
                     and features["ip_rate_1m"] >= 6
                 ):
                     boost += 0.40
-
-                # LATERAL MOVEMENT
 
                 if (
                     features["unique_ips"] >= 6
@@ -655,16 +666,12 @@ try:
 
                 alert_type = "normal"
 
-                # BRUTE FORCE
-
                 if (
-                    features["fail_streak"] >= 8
-                    and features["failed_auth_count_5m"] >= 8
-                    and features["failed_ratio"] > 0.65
+                    features["fail_streak"] >= 5
+                    and features["failed_auth_count_5m"] >= 5
+                    and features["failed_ratio"] > 0.50
                 ):
                     alert_type = "brute_force"
-
-                # PASSWORD SPRAYING
 
                 elif (
                     features["unique_users"] >= 6
@@ -673,8 +680,6 @@ try:
                 ):
                     alert_type = "password_spraying"
 
-                # LATERAL MOVEMENT
-
                 elif (
                     features["unique_ips"] >= 6
                     and features["event_rate_1m"] > 12
@@ -682,15 +687,8 @@ try:
                 ):
                     alert_type = "lateral_movement"
 
-                # GENERIC ANOMALY
-
                 elif (
                     anomaly_score > 0.70
-                    and (
-                        features["failed_ratio"] > 0.20
-                        or features["event_rate_1m"] > 80
-                        or features["ip_failed_ratio"] > 0.30
-                    )
                 ):
                     alert_type = "anomaly"
 
@@ -725,9 +723,6 @@ try:
                     "lateral_movement":
                         "TA0008",
 
-                    "credential_stuffing":
-                        "T1110.004",
-
                     "anomaly":
                         "T1078"
                 }
@@ -741,12 +736,9 @@ try:
                 # TRUST
                 # =================================================
 
-                user = extract_user(event)
-
-                outcome = extract_outcome(event)
-
                 trust_key = (
-                    f"{event['agent']['agent_id']}:{user}"
+                    f"{event['agent']['agent_id']}:"
+                    f"{event['username']}"
                 )
 
                 current_trust = trust_scores[
@@ -757,7 +749,7 @@ try:
                     current_trust,
                     features,
                     anomaly_score,
-                    outcome,
+                    event["outcome"],
                     alert_type
                 )
 
@@ -785,28 +777,35 @@ try:
 
                     "mitre_technique":
                         mitre_technique,
-
-                    "confidence":
-                        round(
-                            min(
-                                1.0,
-                                (
-                                    anomaly_score
-                                    + (
-                                        features[
-                                            "failed_ratio"
-                                        ] * 0.7
-                                    )
-                                    + (
-                                        features[
-                                            "fail_streak"
-                                        ] * 0.02
-                                    )
-                                )
-                            ),
-                            2
-                        ),
                 }
+
+                # =================================================
+                # SOAR EVENT DATA
+                # =================================================
+
+                event["alert_type"] = alert_type
+
+                event["severity"] = severity
+
+                event["mitre_technique"] = (
+                    mitre_technique
+                )
+
+                event["anomaly_score"] = (
+                    anomaly_score
+                )
+
+                event["trust_score"] = (
+                    updated_trust
+                )
+
+                # =================================================
+                # SOAR EXECUTION
+                # =================================================
+
+                if severity in ["high", "critical"]:
+
+                    trigger_soar(event)
 
                 # =================================================
                 # TIMESTAMP
@@ -826,19 +825,11 @@ try:
                     f"T={updated_trust:.2f} | "
                     f"S={severity} | "
                     f"Type={alert_type} | "
-                    f"MITRE={mitre_technique} | "
-                    f"Fail={features['failed_auth_count_5m']} | "
-                    f"Streak={features['fail_streak']} | "
-                    f"Users={features['unique_users']} | "
-                    f"IPs={features['unique_ips']} | "
-                    f"Rate={features['event_rate_1m']} | "
-                    f"IPRate={features['ip_rate_1m']} | "
-                    f"Ratio={features['failed_ratio']:.2f} | "
-                    f"IPRatio={features['ip_failed_ratio']:.2f}"
+                    f"MITRE={mitre_technique}"
                 )
 
                 # =================================================
-                # BULK INSERT
+                # ELASTICSEARCH
                 # =================================================
 
                 bulk_buffer.append({

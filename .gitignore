@@ -26,3 +26,9 @@ security_events.json
 
 
 central-server-py/models/*.pkl
+venv/
+__pycache__/
+*.pyc
+central-server-py/alerts.json
+central-server-py/incidents.json
+.DS_Store
