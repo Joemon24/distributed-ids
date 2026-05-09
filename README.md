@@ -1,4 +1,3 @@
-# distributed-ids
 # Distributed AI-Powered IDS + SOAR Platform
 
 A distributed Intrusion Detection and Response System built using:
