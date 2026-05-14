@@ -36,6 +36,10 @@ from api.soar.response_engine import (
 from api.soar.notifier import (
     send_notification
 )
+from api.rule_engine import (
+    load_rules,
+    evaluate_rules
+)
 # =========================================================
 # SOAR
 # =========================================================
@@ -68,7 +72,7 @@ KAFKA_BROKERS = ["localhost:19092"]
 
 TOPIC = "ids.events.v1"
 
-GROUP_ID = "central-server-final-v31"
+GROUP_ID = "central-server-final-v32"
 
 ES_HOST = "http://localhost:9200"
 
@@ -132,6 +136,10 @@ fail_streak = defaultdict(int)
 
 trust_scores = defaultdict(lambda: 1.0)
 
+correlation_state = {}
+last_alert_time = {}
+ALERT_COOLDOWN = 60
+
 MAX_HISTORY_KEYS = 10000
 
 # =========================================================
@@ -187,7 +195,11 @@ if (
         print(
             f"❌ Failed loading model: {e}"
         )
+# =========================================================
+# LOAD RULES
+# =========================================================
 
+load_rules()
 # =========================================================
 # HELPERS
 # =========================================================
@@ -515,7 +527,28 @@ try:
 
             try:
 
+                if event is None:
+
+                    print("⚠️ Skipping null event")
+
+                    continue
+
+                if not isinstance(event, dict):
+
+                    print(
+                f"⚠️ Invalid event type: {type(event)}"
+                )
+
+                    continue
+
+                if not event:
+
+                    print("⚠️ Empty event skipped")
+
+                    continue
+
                 now = datetime.now(timezone.utc)
+
 
                 if "agent" not in event:
 
@@ -572,6 +605,19 @@ try:
                 event["username"] = extract_user(event)
 
                 event["outcome"] = extract_outcome(event)
+                # =================================================
+
+                # EVENT TYPE
+
+                # =================================================
+
+                event_type = "login_success"
+
+                if event["outcome"] == "failure":
+
+                    event_type = "login_failure"
+
+                event["event_type"] = event_type
 
                 event["features"] = features
 
@@ -659,79 +705,46 @@ try:
                     min(anomaly_score + boost, 1.0),
                     2
                 )
+                # =========================================================
+                # RULE ENGINE
+                # =========================================================
 
-                # =================================================
-                # ALERT TYPES
-                # =================================================
-
-                alert_type = "normal"
-
-                if (
-                    features["fail_streak"] >= 5
-                    and features["failed_auth_count_5m"] >= 5
-                    and features["failed_ratio"] > 0.50
-                ):
-                    alert_type = "brute_force"
-
-                elif (
-                    features["unique_users"] >= 6
-                    and features["ip_failed_ratio"] > 0.50
-                    and features["ip_rate_1m"] >= 6
-                ):
-                    alert_type = "password_spraying"
-
-                elif (
-                    features["unique_ips"] >= 6
-                    and features["event_rate_1m"] > 12
-                    and anomaly_score > 0.45
-                ):
-                    alert_type = "lateral_movement"
-
-                elif (
-                    anomaly_score > 0.70
-                ):
-                    alert_type = "anomaly"
-
-                # =================================================
-                # SEVERITY
-                # =================================================
-
-                if anomaly_score >= 0.85:
-                    severity = "critical"
-
-                elif anomaly_score >= 0.60:
-                    severity = "high"
-
-                elif anomaly_score >= 0.35:
-                    severity = "medium"
-
-                else:
-                    severity = "low"
-
-                # =================================================
-                # MITRE
-                # =================================================
-
-                mitre_mapping = {
-
-                    "brute_force":
-                        "T1110",
-
-                    "password_spraying":
-                        "T1110.003",
-
-                    "lateral_movement":
-                        "TA0008",
-
-                    "anomaly":
-                        "T1078"
-                }
-
-                mitre_technique = mitre_mapping.get(
-                    alert_type,
-                    "none"
+                matched_rules = evaluate_rules(
+                    features
                 )
 
+                if matched_rules:
+
+                    top_rule = matched_rules[0]
+
+                    alert_type = top_rule["type"]
+
+                    severity = top_rule["severity"]
+
+                    mitre_technique = top_rule["mitre"]
+
+                else:
+
+                    alert_type = "normal"
+
+                    mitre_technique = "none"
+
+                    if anomaly_score >= 0.85:
+                        severity = "critical"
+
+                    elif anomaly_score >= 0.60:
+                        severity = "high"
+
+                    elif anomaly_score >= 0.35:
+                        severity = "medium"
+
+                    else:
+                        severity = "low"
+
+                    if anomaly_score > 0.70:
+                        alert_type = "anomaly"
+
+                event["matched_rules"] = matched_rules              
                 # =================================================
                 # TRUST
                 # =================================================
@@ -780,6 +793,7 @@ try:
                 }
 
                 # =================================================
+                # =================================================
                 # SOAR EVENT DATA
                 # =================================================
 
@@ -799,13 +813,108 @@ try:
                     updated_trust
                 )
 
+                
+                event["soar_triggered"] = False
+
+                # =================================================
+                # CORRELATION ENGINE
+                # =================================================
+
+                username = event["username"]
+
+                correlation_key = (
+                    f"{username}:{event['src_ip']}"
+                )
+
+
+                if alert_type == "brute_force":
+
+                    correlation_state[correlation_key] = {
+
+                        "stage": "brute_force",
+
+                        "time": now
+                    }
+
+                if (
+                    correlation_key in correlation_state
+                    and event["event_type"] == "login_success"
+                ):
+
+                    previous = correlation_state[
+                        correlation_key
+                    ]
+                    if previous["stage"] == "brute_force":
+
+                        delta = now - previous["time"]
+
+                        if delta.total_seconds() <= 120:
+
+                            print(
+                                f"🔥 ACCOUNT COMPROMISE: "
+                                f"{username}"
+                            )
+
+                            event["alert_type"] = (
+                                "account_compromise"
+                            )
+
+                            event["severity"] = "critical"
+
+                            event["mitre_technique"] = "T1078"
+
+                            alert_type = "account_compromise"
+
+                            severity = "critical"
+
+                            mitre_technique = "T1078"
+
+                            trigger_soar(event)
+
+                            event["soar_triggered"] = True
+
+                            del correlation_state[
+                                correlation_key
+                            ]
+                # =================================================
                 # =================================================
                 # SOAR EXECUTION
                 # =================================================
 
-                if severity in ["high", "critical"]:
+                alert_key = (
+                    f"{event['alert_type']}:"
+                    f"{event['src_ip']}"
+                )
+
+                last_time = last_alert_time.get(
+                    alert_key
+                )
+
+                if last_time:
+
+                    delta = (
+                        now - last_time
+                    ).total_seconds()
+
+                    if delta < ALERT_COOLDOWN:
+
+                        print(
+                            f"[SUPPRESSED] "
+                            f"{alert_key}"
+                        )
+
+                        continue
+                if (
+                    event["severity"] == "critical"
+                    and not event["soar_triggered"]
+                    ):
 
                     trigger_soar(event)
+                    last_alert_time[
+                        alert_key
+                    ] = now
+
+                    event["soar_triggered"] = True
 
                 # =================================================
                 # TIMESTAMP
@@ -823,9 +932,9 @@ try:
                     f"🚨 "
                     f"A={anomaly_score:.2f} | "
                     f"T={updated_trust:.2f} | "
-                    f"S={severity} | "
-                    f"Type={alert_type} | "
-                    f"MITRE={mitre_technique}"
+                    f"S={event['severity']} | "
+                    f"Type={event['alert_type']} | "
+                    f"MITRE={event['mitre_technique']}"
                 )
 
                 # =================================================

@@ -1,0 +1,19 @@
+title: Lateral Movement Detection
+
+type: lateral_movement
+
+severity: high
+
+mitre:
+  technique: TA0008
+
+conditions:
+
+  unique_ips:
+    gte: 8
+
+  event_rate_1m:
+    gte: 15
+
+  dominance_ratio:
+    lte: 0.50

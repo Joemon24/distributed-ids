@@ -1,0 +1,18 @@
+title: Brute Force Detection
+
+type: brute_force
+
+severity: high
+
+mitre:
+  technique: T1110
+
+conditions:
+  fail_streak:
+    gte: 5
+
+  failed_auth_count_5m:
+    gte: 5
+
+  failed_ratio:
+    gt: 0.5
