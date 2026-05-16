@@ -50,9 +50,10 @@ type RiskBlock struct {
 }
 
 type IntegrityBlock struct {
-	Hash     string `json:"hash"`
-	PrevHash string `json:"prev_hash,omitempty"`
-	ChainID  string `json:"chain_id"`
+	EventHash string `json:"event_hash"`
+	BatchHash string `json:"batch_hash"`
+	PrevHash  string `json:"prev_hash,omitempty"`
+	ChainID   string `json:"chain_id"`
 }
 
 type RawBlock struct {

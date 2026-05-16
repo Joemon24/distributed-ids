@@ -8,6 +8,7 @@ import re
 import os
 import joblib
 import numpy as np
+import hashlib
 
 from datetime import datetime, timedelta, timezone
 from collections import deque, defaultdict, Counter
@@ -536,8 +537,8 @@ try:
                 if not isinstance(event, dict):
 
                     print(
-                f"⚠️ Invalid event type: {type(event)}"
-                )
+                        f"⚠️ Invalid event type: {type(event)}"
+                    )
 
                     continue
 
@@ -547,8 +548,28 @@ try:
 
                     continue
 
-                now = datetime.now(timezone.utc)
+                raw_data = event.get("raw", "")
 
+                received_hash = (
+                    event.get("integrity", {})
+                    .get("hash", "")
+                )
+
+                if raw_data:
+
+                    calculated_hash = hashlib.sha256(
+                        raw_data.encode()
+                    ).hexdigest()
+
+                    if received_hash != calculated_hash:
+
+                        print(
+                            "[INTEGRITY FAIL] Hash mismatch"
+                        )
+
+                        continue
+
+                now = datetime.now(timezone.utc)
 
                 if "agent" not in event:
 

@@ -2,54 +2,9 @@
 # IMPORTS
 # =========================================================
 
-import json
 import random
 import sys
 import time
-import atexit
-
-from datetime import datetime, timezone
-
-from kafka import KafkaProducer
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-KAFKA_BROKERS = ["localhost:19092"]
-
-TOPIC = "ids.events.v1"
-
-# =========================================================
-# KAFKA PRODUCER
-# =========================================================
-
-producer = KafkaProducer(
-    bootstrap_servers=KAFKA_BROKERS,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    linger_ms=10,
-    retries=5
-)
-
-# =========================================================
-# CLEAN SHUTDOWN
-# =========================================================
-
-def cleanup():
-
-    try:
-
-        producer.flush(timeout=10)
-
-        producer.close(timeout=10)
-
-        print("✅ Kafka producer closed cleanly")
-
-    except Exception as e:
-
-        print(f"⚠️ Cleanup error: {e}")
-
-atexit.register(cleanup)
 
 # =========================================================
 # DATA
@@ -90,11 +45,11 @@ lateral_ips = [
     "10.0.0.26",
 ]
 
-agents = [
-    "agent-1",
-    "agent-2",
-    "agent-3",
-]
+# =========================================================
+# LOG FILE
+# =========================================================
+
+LOG_FILE = "/tmp/auth.log"
 
 # =========================================================
 # SEND EVENT
@@ -102,26 +57,11 @@ agents = [
 
 def send_event(raw):
 
-    event = {
+    with open(LOG_FILE, "a") as f:
 
-        "agent": {
+        f.write(raw + "\n")
 
-            "agent_id": random.choice(agents)
-        },
-
-        "raw": raw,
-
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat()
-    }
-
-    future = producer.send(
-        TOPIC,
-        event
-    )
-
-    future.get(timeout=10)
+        f.flush()
 
 # =========================================================
 # NORMAL MODE
@@ -252,7 +192,6 @@ def lateral_mode():
 
         print(raw)
 
-        # slower to reduce flooding
         time.sleep(1.2)
 
 # =========================================================
