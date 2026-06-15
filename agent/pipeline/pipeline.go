@@ -85,9 +85,13 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 
 	if h, err := hashState.LoadLastHash(); err == nil {
 		prevHash = h
+
 	} else {
-		log.Println("WARNING: hash state missing, agent marked untrusted")
-		trustOK = false
+
+		log.Println("No previous hash state found, starting new chain")
+
+		trustOK = true
+
 	}
 
 	/* ---------- SENDER ---------- */
@@ -237,7 +241,10 @@ func (p *Pipeline) Start(ctx context.Context, agentInfo types.AgentInfo) {
 				continue
 			}
 
-			_ = hashState.SaveLastHash(newHash)
+			if err := hashState.SaveLastHash(newHash); err != nil {
+				log.Printf("failed to save hash state: %v", err)
+				trustOK = false
+			}
 
 			var out []sender.EventEnvelope
 

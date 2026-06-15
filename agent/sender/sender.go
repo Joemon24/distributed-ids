@@ -4,3 +4,4 @@ package sender
 type Sender interface {
 	Send(batch any) error
 }
+

@@ -72,7 +72,7 @@ KAFKA_BROKERS = ["localhost:19092"]
 
 TOPIC = "ids.events.v1"
 
-GROUP_ID = "central-server-final-v32"
+GROUP_ID = "debug-v1"
 
 ES_HOST = "http://localhost:9200"
 
@@ -216,37 +216,68 @@ def extract_ip(event):
 
     raw = event.get("raw", "")
 
-    match = re.search(r'ip=([\d\.]+)', raw)
+    if not raw:
+        raw = (
+            event.get("raw_event", {})
+            .get("data", "")
+        )
+
+    match = re.search(
+        r'ip=([\d\.]+)',
+        raw
+    )
 
     if match:
         return match.group(1)
 
-    return f"10.0.0.{random.randint(10,20)}"
+    return "0.0.0.0"
 
 
 def extract_user(event):
 
     raw = event.get("raw", "")
 
-    match = re.search(r'user=([\w\-]+)', raw)
+    if not raw:
+        raw = (
+            event.get("raw_event", {})
+            .get("data", "")
+        )
+
+    match = re.search(
+        r'user=([\w\-]+)',
+        raw
+    )
 
     if match:
         return match.group(1)
 
-    return f"user{random.randint(1,10)}"
-
+    return "unknown"
 
 def extract_outcome(event):
 
-    raw = event.get("raw", "").lower()
+    raw = event.get("raw", "")
 
-    if "failed" in raw or "failure" in raw:
+    if not raw:
+        raw = (
+            event.get("raw_event", {})
+            .get("data", "")
+        )
+
+    raw = raw.lower()
+
+    if "failed" in raw:
         return "failure"
 
-    if "success" in raw or "accepted" in raw:
+    if "failure" in raw:
+        return "failure"
+
+    if "success" in raw:
         return "success"
 
-    return "success"
+    if "accepted" in raw:
+        return "success"
+
+    return "unknown"
 
 # =========================================================
 # FEATURE ENGINE
@@ -501,7 +532,7 @@ consumer = KafkaConsumer(
     TOPIC,
     bootstrap_servers=KAFKA_BROKERS,
     group_id=GROUP_ID,
-    auto_offset_reset="latest",
+    auto_offset_reset="earliest",
     enable_auto_commit=True,
     value_deserializer=lambda v: json.loads(
         v.decode("utf-8")
@@ -712,6 +743,12 @@ try:
                 matched_rules = evaluate_rules(
                     features
                 )
+                print("\n========== FEATURES ==========")
+                print(features)
+
+                print("========== MATCHED RULES ==========")
+                print(matched_rules)
+                print("===================================\n")
 
                 if matched_rules:
 

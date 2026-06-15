@@ -102,26 +102,8 @@ agents = [
 
 def send_event(raw):
 
-    event = {
-
-        "agent": {
-
-            "agent_id": random.choice(agents)
-        },
-
-        "raw": raw,
-
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat()
-    }
-
-    future = producer.send(
-        TOPIC,
-        event
-    )
-
-    future.get(timeout=10)
+    with open("/tmp/auth.log", "a") as f:
+        f.write(raw + "\n")
 
 # =========================================================
 # NORMAL MODE
